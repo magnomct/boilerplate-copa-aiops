@@ -44,7 +44,7 @@ Como engenheiro de plataforma, quero acessar uma página web com a listagem de t
 
 **Rules:**
 - A página exibe todos os relatórios ordenados por `created_at` decrescente (mais recente primeiro)
-- Cada item da lista exibe: ID, data de criação (`created_at`), status e tabela de resumo de severidade (seção `## Resumo` do Markdown)
+- Cada item da lista exibe: ID, data de criação (`created_at`), status e a severidade do problema, lida do campo `**Severidade:**` da seção do problema no Markdown (cada relatório corresponde a um único problema — PRD 002)
 - Cada item é clicável e leva à página de detalhe
 - A página é servida pela própria API FastAPI com template Jinja2
 - O status é exibido como badge com mapeamento para classes CSS do `base.html`: EM_ANALISE → `badge-processing`, COMPLETO → `badge-complete`, INCOMPLETO → `badge-incomplete`, CORRIGINDO → `badge-executing`, CORRIGIDO → `badge-executed`, FALHA_CORRECAO → `badge-execution-failed`
@@ -127,7 +127,8 @@ Este PRD é um habilitador de visualização; não possui métrica de negócio p
 
 - **2026-06-13:** Botão "Executar correção" passa a ser exibido também para relatórios em FALHA_CORRECAO (além de COMPLETO). Motivo: FALHA_CORRECAO deixou de ser estado terminal e admite nova tentativa de correção (decisão do usuário em revisão de 2026-06-13, propagada do PRD 004). O endpoint `POST /reports/{id}/fix` (PRD 004) aceita ambos os status.
 - **2026-06-10:** Campo `id` do relatório definido como UUID. Motivo: exposição em URL requer identificador opaco; compatível com a definição propagada ao PRD 002.
-- **2026-06-10:** Resumo na listagem exibe a tabela de severidade (seção `## Resumo` do Markdown). Motivo: sempre presente na estrutura do relatório (PRD 002); extração simples sem parsing de cada problema.
+- **2026-06-13:** Listagem exibe a severidade lendo o campo `**Severidade:**` da seção do problema, não uma tabela `## Resumo`. Motivo: com a divisão 1-relatório-por-problema (PRD 002, decisão de 2026-06-10), cada relatório contém apenas a seção do seu problema — não há tabela `## Resumo` por relatório. Substitui a decisão de 2026-06-10 abaixo (que assumia `## Resumo` sempre presente, suposição defasada após a divisão).
+- **2026-06-10:** Resumo na listagem exibe a tabela de severidade (seção `## Resumo` do Markdown). Motivo: sempre presente na estrutura do relatório (PRD 002); extração simples sem parsing de cada problema. *(Substituída em 2026-06-13 — ver acima.)*
 - **2026-06-09:** Removida a notificação via Discord do escopo deste PRD. Motivo: simplificação do projeto. A interface web passa a ser o único canal de visualização e acionamento da correção. Removidas a US03, o Milestone de notificação, a variável `APP_BASE_URL` e a dependência do bot Discord.
 - **2026-03-13:** Jinja2 para interface web. Motivo: server-side renderizada pela própria API, sem frontend separado.
 - **2026-03-13:** Sem autenticação na v1. Motivo: simplicidade da primeira entrega.

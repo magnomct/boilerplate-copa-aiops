@@ -132,7 +132,7 @@ Depois da primeira linha, use o formato abaixo:
 **Edge cases:**
 - Passos de correção referenciam recursos que não existem mais → agente registra que o recurso não foi encontrado e continua com os próximos passos
 - MCP Server indisponível durante a correção → abortar e atualizar status para FALHA_CORRECAO
-- Erro na API do Claude durante a correção → `max_retries=3` no `ChatAnthropic` aplica backoff exponencial automaticamente (idêntico ao PRD 002 linha 154); após 3 tentativas, abortar e atualizar status para FALHA_CORRECAO
+- Erro na API do Claude durante a correção → `max_retries=3` no `ChatAnthropic` aplica backoff exponencial automaticamente (mesmo mecanismo do PRD 002); após 3 tentativas, abortar e atualizar status para FALHA_CORRECAO
 - Agente de correção já em execução para o mesmo relatório → endpoint rejeita com `409 Conflict` se status é CORRIGINDO (proteção server-side via UPDATE condicional atômico)
 - Relatório com status diferente de COMPLETO ou FALHA_CORRECAO → endpoint rejeita com `409 Conflict`
 - Aplicação reinicia durante a correção → relatório órfão em CORRIGINDO é marcado como FALHA_CORRECAO no startup, permitindo nova tentativa pelo botão da interface (PRD 003)

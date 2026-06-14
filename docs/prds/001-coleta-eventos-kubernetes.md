@@ -23,13 +23,13 @@ references: ["002"]
 - Loop interno na aplicação FastAPI que executa periodicamente a coleta de eventos do cluster
 - Utiliza o Python SDK do Kubernetes (`kubernetes`) para listar eventos de todos os namespaces
 - Filtra apenas eventos do tipo Warning
-- Coleta apenas eventos ocorridos desde a última coleta bem-sucedida (marca d'água), evitando reprocessamento de eventos antigos e perda de eventos em ciclos com falha
-- Agrupa os eventos coletados e os disponibiliza para consumo pelo pipeline de análise (PRD 002)
+- Coleta apenas eventos ocorridos desde a última coleta bem-sucedida (marca d'água) — otimização de janela de query para não reconsultar eventos antigos; a deduplicação por UID (PRD 002) é o que garante não reprocessar
+- Agrupa os eventos coletados e os despacha de forma assíncrona (fire-and-forget) ao pipeline de análise (PRD 002), sem aguardar a resposta do agente
 
 ### Decisões-chave
 
 1. **Python SDK para coleta** — Utilizar a biblioteca `kubernetes` do Python ao invés do MCP Server. O MCP é reservado para os agentes de IA; a coleta é uma operação simples que não precisa de abstração de agente.
-2. **Loop interno na aplicação** — A coleta roda dentro do processo FastAPI como task assíncrona, sem necessidade de job externo (cron, CronJob K8s).
+2. **Loop interno + despacho assíncrono fire-and-forget** — A coleta roda dentro do processo FastAPI como task assíncrona, sem job externo (cron, CronJob K8s). Os eventos coletados são despachados ao `EventHandler` de forma assíncrona (fire-and-forget): o coletor não aguarda a resposta do agente e segue para o próximo ciclo.
 3. **Intervalo configurável via variável de ambiente** — `EVENT_COLLECTION_INTERVAL_MINUTES` define o período do loop em minutos (padrão: 3 minutos), permitindo ajuste sem rebuild.
 4. **Precedência de timestamps para filtro temporal** — Na API `events.k8s.io/v1`, `eventTime` registra a **primeira** observação do evento; recorrências reportadas via EventSeries atualizam apenas `series.lastObservedTime`. A recência de cada evento é determinada pela precedência: `series.lastObservedTime` (quando presente) → `eventTime` → `deprecatedLastTimestamp` (eventos de controllers legados). Eventos sem nenhum dos três campos são descartados com warning no log.
 5. **Sem limite de eventos por ciclo** — Todos os eventos Warning do intervalo são coletados e entregues, independente da quantidade.
@@ -53,11 +53,11 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 - Apenas eventos do tipo Warning são coletados (o tipo "Error" não existe na API de eventos do Kubernetes; problemas como CrashLoopBackOff, OOMKilled e FailedScheduling são reportados como Warning)
 - A coleta abrange todos os namespaces do cluster
 - O intervalo de coleta é configurável via variável de ambiente `EVENT_COLLECTION_INTERVAL_MINUTES` em minutos (padrão: 3 minutos)
-- Apenas eventos ocorridos desde a última coleta bem-sucedida são coletados (marca d'água), com recência determinada pela precedência `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp`
-- A marca d'água só avança quando o `EventHandler` processa o batch sem erro; falha no processamento mantém a marca d'água e os eventos são reentregues no próximo ciclo
-- Eventos coletados no mesmo intervalo são agrupados antes de serem entregues ao pipeline de análise
+- Apenas eventos ocorridos desde a última coleta bem-sucedida são coletados (marca d'água — otimização de janela de query), com recência determinada pela precedência `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp`
+- A marca d'água avança a cada coleta bem-sucedida, independentemente do resultado do processamento pelo `EventHandler` (despacho fire-and-forget). A deduplicação por UID (PRD 002) é o único guardião contra reprocessamento; falhas no processamento não seguram a marca d'água — a recuperação se dá por recorrência do evento + recovery de startup/stale do PRD 002
+- Eventos coletados no mesmo intervalo são agrupados antes de serem despachados ao pipeline de análise
 - Não há limite de eventos por ciclo de coleta
-- Os eventos coletados são transformados em dicts com contrato definido e entregues a uma classe de tratamento (handler) que nesta fase imprime os dados no output; a implementação real será feita no PRD 002
+- Os eventos coletados são transformados em dicts com contrato definido e despachados de forma assíncrona (fire-and-forget) a uma classe de tratamento (handler) que nesta fase imprime os dados no output; a implementação real será feita no PRD 002
 
 **Contrato de saída (estrutura de cada evento entregue ao handler):**
 ```python
@@ -79,8 +79,8 @@ Como engenheiro DevOps, quero que os eventos Warning do cluster sejam coletados 
 O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API `events.k8s.io/v1`: `note` → `message`, `regarding` → `involved_object` (os nomes `message` e `involvedObject` pertencem à API core/v1 e não existem na API nova).
 
 **Edge cases:**
-- Cluster inacessível durante a coleta → registrar erro no log e aguardar o próximo ciclo sem interromper o loop; a marca d'água não avança, então os eventos do período da falha são coletados no próximo ciclo bem-sucedido
-- `EventHandler` lança erro ao processar o batch (ex: falha do pipeline de análise do PRD 002 ou banco indisponível) → registrar erro no log e não avançar a marca d'água; os eventos são recoletados e reentregues no próximo ciclo
+- Cluster inacessível durante a coleta → registrar erro no log e aguardar o próximo ciclo sem interromper o loop; como nada foi coletado, a marca d'água naturalmente não avança e a janela é reconsultada no próximo ciclo bem-sucedido
+- `EventHandler` lança erro ao processar o batch (ex: falha do pipeline de análise do PRD 002 ou banco indisponível) → o handler roda em task assíncrona e trata seus próprios erros internamente (o PRD 002 marca o relatório como INCOMPLETO ou descarta o batch); o erro **não** afeta a marca d'água nem é propagado ao coletor. Eventos one-shot perdidos nesse cenário são risco aceito na v1 (ver Riscos)
 - Nenhum evento Warning encontrado no intervalo → não disparar análise, aguardar próximo ciclo
 - Volume alto de eventos no mesmo intervalo → sem limite; todos os eventos são coletados e entregues como batch único
 - Variável de ambiente `EVENT_COLLECTION_INTERVAL_MINUTES` com valor inválido (não-numérico, negativo ou zero) → usar o padrão de 3 minutos e registrar warning no log
@@ -95,8 +95,8 @@ O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API 
 - O SDK `kubernetes` é síncrono (HTTP bloqueante) — executar as chamadas de listagem via `asyncio.to_thread` para não bloquear o event loop do FastAPI
 - Autenticação com o cluster: tentar `config.load_incluster_config()` (execução dentro do cluster) com fallback para `config.load_kube_config()` (execução local via kubeconfig)
 - O filtro temporal usa a API `events.k8s.io/v1` com precedência de recência: `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp`
-- A marca d'água (timestamp da última coleta bem-sucedida) é mantida em memória e só avança após o `EventHandler` processar o batch sem erro; na primeira execução após o start, a janela inicial é o intervalo configurado *(premissa — confirme ou corrija)*
-- Criar uma classe handler (ex: `EventHandler`) com método de processamento que recebe a lista de eventos no formato do contrato de saída. A implementação inicial apenas imprime os dados no output (stdout), sinalizando que o processamento real será implementado no PRD 002
+- A marca d'água (timestamp da última coleta bem-sucedida) é mantida em memória e avança após cada coleta bem-sucedida, independentemente do processamento pelo `EventHandler` (despacho fire-and-forget). Na primeira execução após o start, a janela inicial é o intervalo configurado. Perder a marca d'água em um restart é inofensivo: a deduplicação por UID (PRD 002) impede reprocessar o overlap recoletado
+- Criar uma classe handler (ex: `EventHandler`) com método assíncrono `async def handle(events: list[dict]) -> None` que recebe a lista de eventos no formato do contrato de saída. O handler é invocado como task assíncrona fire-and-forget (ex: `asyncio.create_task`) e **captura suas próprias exceções** (não as propaga ao loop do coletor). A implementação inicial apenas imprime os dados no output (stdout), sinalizando que o processamento real será implementado no PRD 002
 
 ## 4. Critérios de Aceite
 
@@ -108,7 +108,7 @@ O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API 
 | Apenas eventos Warning são coletados | Teste com cluster de teste contendo eventos de todos os tipos |
 | Coleta abrange todos os namespaces | Teste com eventos em múltiplos namespaces |
 | Apenas eventos desde a última coleta bem-sucedida (marca d'água) são coletados | Teste com eventos antigos e recentes, validando que apenas os posteriores à marca d'água são retornados |
-| Marca d'água não avança quando o `EventHandler` falha | Teste automatizado simulando erro no handler e validando reentrega do batch no ciclo seguinte |
+| Eventos são despachados ao `EventHandler` de forma assíncrona (fire-and-forget), sem o coletor aguardar a resposta | Teste automatizado validando que o ciclo de coleta prossegue sem bloquear na execução do handler |
 | Eventos são agrupados no formato do contrato de saída e entregues ao handler | Teste de integração validando o payload entregue contra o contrato definido |
 | Precedência de timestamps funciona (series.lastObservedTime → eventTime → deprecatedLastTimestamp) | Testes com evento recorrente (series presente e eventTime antigo), evento sem series e evento legado sem eventTime |
 
@@ -131,9 +131,9 @@ O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API 
 - [ ] Implementar loop assíncrono com intervalo configurável via `EVENT_COLLECTION_INTERVAL_MINUTES`, executando as chamadas do SDK via `asyncio.to_thread` (US01)
 - [ ] Filtrar eventos por tipo (Warning) e por recência desde a marca d'água, com precedência series.lastObservedTime → eventTime → deprecatedLastTimestamp (US01)
 - [ ] Implementar transformação dos eventos do SDK para o contrato de saída definido (US01)
-- [ ] Criar classe `EventHandler` com implementação placeholder que imprime eventos no output (US01)
-- [ ] Agrupar eventos coletados no formato do contrato e entregar ao `EventHandler` (US01)
-- [ ] Avançar a marca d'água somente após o `EventHandler` processar o batch sem erro (US01)
+- [ ] Criar classe `EventHandler` com método assíncrono `async def handle(events)` e implementação placeholder que imprime eventos no output (US01)
+- [ ] Agrupar eventos coletados no formato do contrato e despachar de forma assíncrona (fire-and-forget) ao `EventHandler`, via `asyncio.create_task`, sem aguardar a resposta (US01)
+- [ ] Avançar a marca d'água após a coleta bem-sucedida, independentemente do resultado do `EventHandler` (US01)
 - [ ] Tratar erros de conectividade e RBAC com logging adequado, sem interromper o loop (US01)
 
 **Critério de conclusão:**
@@ -147,6 +147,7 @@ O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API 
 |-------|---------|-----------|--------|
 | Permissões RBAC insuficientes no cluster impedem coleta | Alto | Documentar ClusterRole necessária com permissão de leitura em events de todos os namespaces | Pendente |
 | Volume muito alto de eventos pode impactar performance da aplicação | Baixo | Sem limite de eventos por ciclo; paginação não será implementada neste momento. Monitorar em produção | Aceito |
+| Evento one-shot que falhe antes de existir relatório (ex: banco fora na dedup do PRD 002) é perdido — a marca d'água já avançou e o evento não recorre | Médio | Aceito na v1. Recuperação só via recorrência do evento + recovery de startup/stale (PRD 002); eventos brutos não são persistidos (decisão de escopo) | Aceito |
 
 **Dependências:**
 
@@ -174,9 +175,13 @@ O contrato usa nomes próprios, desacoplados do SDK. Mapeamento a partir da API 
 - **2026-03-22:** Definido contrato de saída (dict com campos uid, type, reason, message, namespace, involved_object, timestamp) para desacoplar o handler do SDK Kubernetes.
 - **2026-03-22:** Variável de ambiente renomeada de `INTERVAL` para `EVENT_COLLECTION_INTERVAL_MINUTES` para evitar colisão e explicitar a unidade.
 - **2026-06-10:** Filtro temporal passa a usar a precedência `series.lastObservedTime` → `eventTime` → `deprecatedLastTimestamp` (substitui a decisão de 2026-03-22). Motivo: `eventTime` registra apenas a primeira observação do evento; recorrências via EventSeries atualizam só `series.lastObservedTime` — sem a precedência, problemas contínuos (ex: FailedScheduling) deixariam de ser coletados após a primeira janela.
-- **2026-06-10:** Janela de coleta definida por marca d'água (timestamp da última coleta bem-sucedida), não por intervalo fixo. Motivo: ciclos com falha não avançam a marca d'água, evitando perda silenciosa de eventos ocorridos durante a indisponibilidade.
+- **2026-06-10:** Janela de coleta definida por marca d'água (timestamp da última coleta bem-sucedida), não por intervalo fixo. Motivo: ciclos com falha não avançam a marca d'água, evitando perda silenciosa de eventos ocorridos durante a indisponibilidade. *(Substituída em 2026-06-13 — ver abaixo: marca d'água vira otimização de janela e avança na coleta.)*
 - **2026-06-10:** Autenticação via `config.load_incluster_config()` com fallback para `config.load_kube_config()`. Motivo: padrão documentado do SDK; cobre execução dentro e fora do cluster.
 - **2026-06-10:** Chamadas do SDK executadas via `asyncio.to_thread`. Motivo: o SDK `kubernetes` é síncrono e bloquearia o event loop do FastAPI se chamado diretamente na task assíncrona.
 - **2026-06-10:** Mapeamento de campos da API `events.k8s.io/v1` documentado no contrato (`note` → `message`, `regarding` → `involved_object`); `involved_object.namespace` pode ser string vazia para recursos cluster-scoped (ex: Node).
 - **2026-06-10:** Removida a entrada de 2026-03-22 que dava o PRD como concluído — nenhum PRD foi implementado (confirmado pelo usuário em revisão de 2026-06-10). Status permanece `rascunho`.
-- **2026-06-10:** A marca d'água só avança quando o `EventHandler` processa o batch sem erro (refina a decisão de marca d'água acima). Motivo: eventos brutos não são persistidos; se a análise (PRD 002) falhar com a marca d'água avançada, eventos one-shot seriam perdidos silenciosamente. Decisão do usuário na revisão do PRD 002 (2026-06-10): um incidente precisa ser resolvido.
+- **2026-06-10:** A marca d'água só avança quando o `EventHandler` processa o batch sem erro (refina a decisão de marca d'água acima). Motivo: eventos brutos não são persistidos; se a análise (PRD 002) falhar com a marca d'água avançada, eventos one-shot seriam perdidos silenciosamente. Decisão do usuário na revisão do PRD 002 (2026-06-10): um incidente precisa ser resolvido. *(Substituída em 2026-06-13 — ver abaixo: despacho assíncrono fire-and-forget desacopla a marca d'água do resultado do handler.)*
+- **2026-06-13:** Despacho assíncrono fire-and-forget: o coletor despacha os eventos ao `EventHandler` sem aguardar a resposta do agente e segue para o próximo ciclo. Motivo: decisão do usuário — o gerenciamento e o envio dos eventos devem ser assíncronos, independentes da resposta do agente.
+- **2026-06-13:** A marca d'água passa a ser otimização de janela de coleta e avança a cada coleta bem-sucedida, desacoplada do resultado do `EventHandler`. A deduplicação por UID (PRD 002) é o único guardião de correção contra reprocessamento. Substitui as duas decisões de marca-d'água-por-hold de 2026-06-10.
+- **2026-06-13:** Perda de evento one-shot em falha pré-relatório aceita na v1 (ex: banco fora na dedup). Motivo: sem hold de marca d'água e sem persistência de eventos brutos, o evento não recorrente que falha antes de gerar relatório não é recuperável; recuperação só via recorrência + recovery de startup/stale do PRD 002.
+- **2026-06-13:** Janela inicial na primeira execução = intervalo configurado (resolve a premissa que estava em aberto nas notas de implementação).
